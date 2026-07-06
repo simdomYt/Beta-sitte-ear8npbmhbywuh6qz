@@ -372,7 +372,7 @@ import { getDatabase, ref, set, get, push, onValue, update, remove }
   from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
 import {
   getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut,
-  onAuthStateChanged, sendEmailVerification, sendPasswordResetEmail
+  onAuthStateChanged, sendEmailVerification, sendPasswordResetEmail, updateProfile
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 
 // Конфігурація Firebase зберігається у Base64, щоб вона не "світилась" відкритим
@@ -538,13 +538,47 @@ onAuthStateChanged(auth, async (fbUser) => {
   }
 
   try {
+    console.log('[onAuthStateChanged] Email підтверджено, перевіряємо наявність Users/' + fbUser.uid);
     const snap = await get(ref(db, 'Users/' + fbUser.uid));
+
     if(!snap.exists()){
-      alert('Профіль користувача не знайдено. Зверніться до підтримки.');
-      await signOut(auth);
+      // Перший успішний вхід ПІСЛЯ підтвердження email: профілю Users/{uid} і
+      // запису Nicknames/{nickname} ще не існує (за новою логікою вони свідомо
+      // НЕ створювались під час sendRegCode()). Створюємо їх щойно тепер.
+      console.log('[onAuthStateChanged] Профіль відсутній — перший вхід після підтвердження. Створюємо Users і Nicknames.');
+
+      // Нікнейм, обраний під час реєстрації, зберігався не в Realtime Database
+      // (щоб не засмічувати базу непідтвердженими акаунтами), а прямо в профілі
+      // Firebase Authentication через updateProfile({displayName: nick}) — це
+      // поле не зникає після signOut/повторного signIn.
+      let nickname = (fbUser.displayName || '').trim();
+      if(!isValidNick(nickname)){
+        // Теоретично не повинно траплятись для акаунтів, зареєстрованих через
+        // sendRegCode(), але про всяк випадок формуємо запасний унікальний нік.
+        nickname = 'user_' + fbUser.uid.slice(0, 8);
+      }
+      // Остаточна перевірка унікальності: нікнейм міг зайняти хтось інший, поки
+      // цей користувач тримав лист із підтвердженням непрочитаним.
+      const collision = await findAccountByNickname(nickname);
+      if(collision && collision.uid !== fbUser.uid){
+        nickname = nickname.slice(0, 14) + '_' + fbUser.uid.slice(0, 4);
+      }
+
+      const userData = {
+        uid: fbUser.uid, nickname, email: fbUser.email,
+        avatar: '', phone: '', desc: '', rating: 0,
+        createdAt: Date.now(), banned: false, strikes: 0, lastActive: Date.now()
+      };
+      await set(ref(db, 'Users/' + fbUser.uid), userData);
+      console.log('[onAuthStateChanged] Users/' + fbUser.uid + ' створено');
+      await set(ref(db, 'Nicknames/' + nickname.toLowerCase()), { uid: fbUser.uid, email: fbUser.email });
+      console.log('[onAuthStateChanged] Nicknames/' + nickname.toLowerCase() + ' створено');
+
+      checkBanAndLogin(fbUser.uid, userData);
       _authHandledOnce = true;
       return;
     }
+
     checkBanAndLogin(fbUser.uid, snap.val());
   } catch(e){
     alert('Не вдалося завантажити профіль: ' + e.message);
@@ -633,50 +667,81 @@ window.sendRegCode = async function(){
   if(!isValidEmail(email)){ alert('Введіть коректну email адресу'); return; }
 
   // Вмикаємо прапорець ДО createUserWithEmailAndPassword: onAuthStateChanged
-  // може спрацювати вже на цей виклик, і його потрібно тримати "у сплячому
-  // режимі" на весь час реєстрації, інакше саме він передчасно робить signOut().
+  // може спрацювати вже на цей виклик (і на виклик signInWithEmailAndPassword
+  // у catch-гілці нижче), і його потрібно тримати "у сплячому режимі" на весь
+  // час реєстрації — цю логіку тут повністю контролюємо самі.
   isRegistering = true;
   try {
     const existingNick = await findAccountByNickname(nick);
     if(existingNick){ alert('Нікнейм зайнятий'); return; }
 
-    const cred = await createUserWithEmailAndPassword(auth, email, pass);
+    let cred;
+    try {
+      cred = await createUserWithEmailAndPassword(auth, email, pass);
+      console.log('[sendRegCode] Крок 1/4: createUserWithEmailAndPassword OK, uid =', cred.user.uid);
+    } catch(createErr){
+      if(createErr.code === 'auth/email-already-in-use'){
+        // Акаунт із таким email уже існує в Firebase Authentication. Це не
+        // обов'язково помилка користувача: можливо, він уже реєструвався
+        // раніше, але так і не підтвердив email. Перевіряємо це, спробувавши
+        // увійти з тим самим паролем — БЕЗ додаткового запиту пароля вдруге.
+        console.log('[sendRegCode] auth/email-already-in-use — перевіряємо, чи це той самий користувач (спроба входу)');
+        let existingCred;
+        try {
+          existingCred = await signInWithEmailAndPassword(auth, email, pass);
+        } catch(signInErr){
+          console.log('[sendRegCode] Пароль не підійшов до наявного акаунта:', signInErr.code);
+          alert('Ця email адреса вже використовується іншим акаунтом. Якщо це ваш акаунт — скористайтесь входом або кнопкою "Забули пароль?".');
+          return;
+        }
+
+        if(existingCred.user.emailVerified){
+          console.log('[sendRegCode] Наявний акаунт уже підтверджений — просимо просто увійти');
+          await signOut(auth);
+          alert('На цю адресу вже зареєстровано підтверджений акаунт. Будь ласка, увійдіть, використовуючи ваш email і пароль.');
+          return;
+        }
+
+        // Пароль правильний, але email ще не підтверджено — повторно
+        // надсилаємо лист підтвердження замість того, щоб просто показати помилку.
+        console.log('[sendRegCode] Акаунт існує, email не підтверджено — повторно надсилаємо лист підтвердження');
+        await sendEmailVerification(existingCred.user);
+        await signOut(auth);
+        alert('На цю адресу вже створено акаунт. Ми повторно надіслали лист підтвердження.');
+        return;
+      }
+      throw createErr;
+    }
+
     const uid = cred.user.uid;
-    console.log('[sendRegCode] Крок 1/6: createUserWithEmailAndPassword OK, uid =', uid, ', auth.currentUser =', auth.currentUser && auth.currentUser.uid);
+
+    // Нікнейм НЕ пишеться в Realtime Database (щоб база не засмічувалась
+    // непідтвердженими акаунтами), а зберігається прямо в профілі Firebase
+    // Authentication. Це поле переживе signOut() і майбутній вхід користувача.
+    await updateProfile(cred.user, { displayName: nick });
+    console.log('[sendRegCode] Крок 2/4: updateProfile(displayName=' + nick + ') OK');
 
     await sendEmailVerification(cred.user);
-    console.log('[sendRegCode] Крок 2/6: sendEmailVerification OK, лист надіслано на', email);
+    console.log('[sendRegCode] Крок 3/4: sendEmailVerification OK, лист надіслано на', email);
 
-    const userData = {
-      uid, nickname: nick, email,
-      avatar: '', phone: '', desc: '', rating: 0,
-      createdAt: Date.now(), banned: false, strikes: 0, lastActive: Date.now()
-    };
+    // Users/{uid} і Nicknames/{nick} свідомо НЕ створюються тут. Вони будуть
+    // створені лише один раз — при першому вході з підтвердженим email,
+    // всередині onAuthStateChanged (див. вище).
+    console.log('[sendRegCode] Users/Nicknames свідомо НЕ записуються до підтвердження email');
 
-    console.log('[sendRegCode] Крок 3/6: перед записом Users/' + uid + ', auth.currentUser =', auth.currentUser && auth.currentUser.uid, ', currentUser===cred.user:', auth.currentUser === cred.user);
-    await set(ref(db, 'Users/' + uid), userData);
-    console.log('[sendRegCode] Крок 4/6: запис Users/' + uid + ' успішний');
-
-    console.log('[sendRegCode] Крок 5/6: перед записом Nicknames/' + nick.toLowerCase());
-    await set(ref(db, 'Nicknames/' + nick.toLowerCase()), { uid, email });
-    console.log('[sendRegCode] Крок 6/6: запис Nicknames/' + nick.toLowerCase() + ' успішний');
-
-    // Одразу після реєстрації Firebase автоматично входить у щойно створений
-    // акаунт, але email ще не підтверджено — виходимо, поки підтвердження не буде
-    // отримано (це також продублює onAuthStateChanged, який ловить той самий стан).
-    console.log('[sendRegCode] Перед signOut, auth.currentUser =', auth.currentUser && auth.currentUser.uid);
+    console.log('[sendRegCode] Крок 4/4: перед signOut, auth.currentUser =', auth.currentUser && auth.currentUser.uid);
     await signOut(auth);
     console.log('[sendRegCode] signOut виконано успішно');
 
     const statusBox = document.getElementById('regEmailStatus');
     statusBox.style.display = '';
-    statusBox.querySelector('p').textContent = '✅ Лист для підтвердження email надіслано на ' + email + '. Перейдіть за посиланням у листі (перевірте також папку "Спам"), а потім увійдіть за допомогою нікнейму та пароля.';
+    statusBox.querySelector('p').textContent = '✅ Лист для підтвердження email надіслано на ' + email + '. Перейдіть за посиланням у листі (перевірте також папку "Спам"), а потім увійдіть, вказавши email і пароль.';
   } catch(e){
     console.log('[sendRegCode] ПОМИЛКА:', e.code || '(без коду)', e.message);
     alert('Не вдалося зареєструватись: ' + e.message);
   } finally {
     // Прапорець знімаємо в будь-якому випадку (успіх чи помилка), інакше
-    // onAuthStateChanged назавжди залишиться "заблокованим" після невдалої спроби.
+    // onAuthStateChanged назавжди залишиться "заблокованим" після цієї спроби.
     isRegistering = false;
   }
 };
@@ -686,17 +751,31 @@ window.doLogin = async function(){
   const nick = document.getElementById('loginNick').value.trim();
   const pass = document.getElementById('loginPass').value;
   if(!nick||!pass){ alert('Заповни нікнейм і пароль'); return; }
-  if(!isValidNick(nick)){ alert('Невірний формат нікнейму'); return; }
 
-  const account = await findAccountByNickname(nick);
-  if(!account){ alert('Користувача не знайдено'); return; }
+  // Поле логіна приймає або нікнейм, або email. Це принципово важливо саме
+  // для ПЕРШОГО входу після реєстрації: доти, доки email не підтверджено,
+  // запису Nicknames/{нік} у базі ще не існує (він з'являється лише після
+  // підтвердження, всередині onAuthStateChanged) — тож знайти email за
+  // нікнеймом на цьому етапі неможливо, і користувач має ввійти через email,
+  // який йому й підказано використати в тексті листа/статус-повідомлення.
+  let email;
+  if(isValidEmail(nick)){
+    email = nick;
+  } else if(isValidNick(nick)){
+    const account = await findAccountByNickname(nick);
+    if(!account){ alert('Користувача не знайдено. Якщо ви щойно підтвердили email і ще жодного разу не входили — увійдіть, вказавши email замість нікнейму.'); return; }
+    email = account.email;
+  } else {
+    alert('Невірний формат нікнейму або email');
+    return;
+  }
 
   try {
-    await signInWithEmailAndPassword(auth, account.email, pass);
-    // Подальші кроки (перевірка email, перевірка бану, завантаження профілю)
-    // виконує onAuthStateChanged.
+    await signInWithEmailAndPassword(auth, email, pass);
+    // Подальші кроки (перевірка email, створення профілю за потреби,
+    // перевірка бану, завантаження профілю) виконує onAuthStateChanged.
   } catch(e){
-    alert('Невірний нікнейм або пароль');
+    alert('Невірний нікнейм/email або пароль');
   }
 };
 
