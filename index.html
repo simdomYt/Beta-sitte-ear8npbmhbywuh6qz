@@ -428,6 +428,19 @@ let popupAdInterval = null;
 let popupAdCloseTimeout = null;
 let lastPopupAdId = null;
 
+// ФІКС PERMISSION_DENIED ПРИ РЕЄСТРАЦІЇ:
+// createUserWithEmailAndPassword() автоматично логінить щойно створеного
+// користувача, і це миттєво (асинхронно, в паралель із rest коду sendRegCode())
+// тригерить onAuthStateChanged() нижче. Той обробник бачив emailVerified=false
+// і одразу викликав signOut(auth) — паралельно з тим, як sendRegCode() ще
+// намагався виконати await set(ref(db,'Users/'+uid), userData) та
+// await set(ref(db,'Nicknames/'+nick), ...). Через мережеву затримку signOut()
+// іноді встигав завершитись РАНІШЕ за записи в базу — auth.currentUser ставав
+// null саме в момент виклику set(), і Security Rules ("auth != null") цілком
+// справедливо відхиляли запис -> PERMISSION_DENIED. Прапорець isRegistering
+// каже onAuthStateChanged "не втручайся, поки триває процес реєстрації".
+let isRegistering = false;
+
 /* ======================= АВТЕНТИФІКАЦІЯ: FIREBASE AUTHENTICATION =======================
    Власна система паролів (PBKDF2-хешування, солі, токени сесій) повністю видалена.
    Реєстрація, вхід, вихід, підтвердження email і відновлення пароля тепер повністю
@@ -495,6 +508,15 @@ const MAX_VIDEO_BYTES = 20 * 1024 * 1024;  // 20 МБ на відео
 // відновив попередню сесію користувача) і після кожного входу/виходу.
 let _authHandledOnce = false;
 onAuthStateChanged(auth, async (fbUser) => {
+  // Поки sendRegCode() виконує реєстрацію (createUserWithEmailAndPassword ->
+  // sendEmailVerification -> запис Users/Nicknames -> signOut), цей колбек
+  // ігнорується повністю. Інакше він встигав сам зробити signOut(auth) через
+  // непідтверджений email РАНІШЕ, ніж завершувались await set(...) у
+  // sendRegCode(), і auth.currentUser ставав null просто в процесі запису.
+  if(isRegistering){
+    console.log('[onAuthStateChanged] Пропущено: триває процес реєстрації (isRegistering=true)');
+    return;
+  }
   if(!fbUser){
     currentUser = null;
     document.getElementById('app').style.display = 'none';
@@ -610,33 +632,52 @@ window.sendRegCode = async function(){
   if(pass !== pass2){ alert('Паролі не співпадають'); return; }
   if(!isValidEmail(email)){ alert('Введіть коректну email адресу'); return; }
 
+  // Вмикаємо прапорець ДО createUserWithEmailAndPassword: onAuthStateChanged
+  // може спрацювати вже на цей виклик, і його потрібно тримати "у сплячому
+  // режимі" на весь час реєстрації, інакше саме він передчасно робить signOut().
+  isRegistering = true;
   try {
     const existingNick = await findAccountByNickname(nick);
     if(existingNick){ alert('Нікнейм зайнятий'); return; }
 
     const cred = await createUserWithEmailAndPassword(auth, email, pass);
     const uid = cred.user.uid;
+    console.log('[sendRegCode] Крок 1/6: createUserWithEmailAndPassword OK, uid =', uid, ', auth.currentUser =', auth.currentUser && auth.currentUser.uid);
 
     await sendEmailVerification(cred.user);
+    console.log('[sendRegCode] Крок 2/6: sendEmailVerification OK, лист надіслано на', email);
 
     const userData = {
       uid, nickname: nick, email,
       avatar: '', phone: '', desc: '', rating: 0,
       createdAt: Date.now(), banned: false, strikes: 0, lastActive: Date.now()
     };
+
+    console.log('[sendRegCode] Крок 3/6: перед записом Users/' + uid + ', auth.currentUser =', auth.currentUser && auth.currentUser.uid, ', currentUser===cred.user:', auth.currentUser === cred.user);
     await set(ref(db, 'Users/' + uid), userData);
+    console.log('[sendRegCode] Крок 4/6: запис Users/' + uid + ' успішний');
+
+    console.log('[sendRegCode] Крок 5/6: перед записом Nicknames/' + nick.toLowerCase());
     await set(ref(db, 'Nicknames/' + nick.toLowerCase()), { uid, email });
+    console.log('[sendRegCode] Крок 6/6: запис Nicknames/' + nick.toLowerCase() + ' успішний');
 
     // Одразу після реєстрації Firebase автоматично входить у щойно створений
     // акаунт, але email ще не підтверджено — виходимо, поки підтвердження не буде
     // отримано (це також продублює onAuthStateChanged, який ловить той самий стан).
+    console.log('[sendRegCode] Перед signOut, auth.currentUser =', auth.currentUser && auth.currentUser.uid);
     await signOut(auth);
+    console.log('[sendRegCode] signOut виконано успішно');
 
     const statusBox = document.getElementById('regEmailStatus');
     statusBox.style.display = '';
     statusBox.querySelector('p').textContent = '✅ Лист для підтвердження email надіслано на ' + email + '. Перейдіть за посиланням у листі (перевірте також папку "Спам"), а потім увійдіть за допомогою нікнейму та пароля.';
   } catch(e){
+    console.log('[sendRegCode] ПОМИЛКА:', e.code || '(без коду)', e.message);
     alert('Не вдалося зареєструватись: ' + e.message);
+  } finally {
+    // Прапорець знімаємо в будь-якому випадку (успіх чи помилка), інакше
+    // onAuthStateChanged назавжди залишиться "заблокованим" після невдалої спроби.
+    isRegistering = false;
   }
 };
 
